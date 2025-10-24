@@ -13,6 +13,7 @@ import {
   isOrderAlreadyMatched,
   logOfferMessage,
   listOfferMessagesForOrder,
+  linkInventoryToOrder,
 } from "./lib/airtable.js";
 
 const app = express();
@@ -98,6 +99,7 @@ await onButtonInteraction(async ({ action, orderRecId, sellerId, inventoryRecord
     if (action === "confirm") {
       await setInventorySold(inventoryRecordId, offerPrice);
       await setOrderMatched(orderRecId);
+      await linkInventoryToOrder(inventoryRecordId, orderRecId);
 
       const msgs = await listOfferMessagesForOrder(orderRecId);
       await Promise.allSettled(
