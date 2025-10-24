@@ -77,44 +77,46 @@ app.post("/offers", async (req, res) => {
   }
 });
 
-/** Button interactions via gateway */
-onButtonInteraction(async ({ action, orderRecId, sellerId, inventoryRecordId, offerPrice, channelId, messageId }) => {
-  // Idempotency: stop if already matched
-  const already = await isOrderAlreadyMatched(orderRecId);
-  if (already) {
-    // Just disable this one button set so users see it's closed
-    await disableMessageButtonsGateway(channelId, messageId, "⛔ Already matched. Buttons disabled.");
-    return;
-  }
-
-  if (action === "confirm") {
-    await setInventorySold(inventoryRecordId, offerPrice);
-    await setOrderMatched(orderRecId);
-    const msgs = await listOfferMessagesForOrder(orderRecId);
-    await Promise.allSettled(
-      msgs.map(m =>
-        disableMessageButtonsGateway(
-          m.channelId,
-          m.messageId,
-          `✅ Matched by ${sellerId}. Offers closed.`
-        )
-      )
-    );
-  } else if (action === "deny") {
-    await disableMessageButtonsGateway(
-      channelId,
-      messageId,
-      `❌ ${sellerId} denied / not available.`
-    );
-  }
-});
-
 // 404
 app.use((req, res) => res.status(404).json({ error: "Not found" }));
 
-// Start HTTP + Discord gateway
+/** Start everything */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("HTTP listening on :" + PORT));
 
-// Initialize Discord gateway (no interactions URL needed)
-await initDiscord();
+/** Initialize Discord first, then attach the interaction handler */
+const client = await initDiscord();
+
+await onButtonInteraction(async ({ action, orderRecId, sellerId, inventoryRecordId, offerPrice, channelId, messageId }) => {
+  try {
+    const already = await isOrderAlreadyMatched(orderRecId);
+    if (already) {
+      await disableMessageButtonsGateway(channelId, messageId, "⛔ Already matched. Buttons disabled.");
+      return;
+    }
+
+    if (action === "confirm") {
+      await setInventorySold(inventoryRecordId, offerPrice);
+      await setOrderMatched(orderRecId);
+
+      const msgs = await listOfferMessagesForOrder(orderRecId);
+      await Promise.allSettled(
+        msgs.map(m =>
+          disableMessageButtonsGateway(
+            m.channelId,
+            m.messageId,
+            `✅ Matched by ${sellerId}. Offers closed.`
+          )
+        )
+      );
+    } else if (action === "deny") {
+      await disableMessageButtonsGateway(
+        channelId,
+        messageId,
+        `❌ ${sellerId} denied / not available.`
+      );
+    }
+  } catch (err) {
+    console.error("Interaction handling error:", err);
+  }
+});
