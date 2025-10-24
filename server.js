@@ -13,22 +13,19 @@ import {
   isOrderAlreadyMatched,
   logOfferMessage,
   listOfferMessagesForOrder,
-  linkInventoryToOrder,
+  linkInventoryToOrder
 } from "./lib/airtable.js";
 
 const app = express();
 app.use(morgan("combined"));
 
-/** Health */
 app.get("/", (req, res) => {
   res.type("text/plain").send("Consignment Discord bot is running (gateway mode).");
 });
 
-/** Normal parsers for HTTP routes */
 app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: true }));
 
-/** Airtable → Offers (order + sellers[]) */
 app.post("/offers", async (req, res) => {
   try {
     const p = req.body || {};
@@ -46,12 +43,19 @@ app.post("/offers", async (req, res) => {
 
     const results = [];
     for (const s of sellers) {
+      // log to prove we received productName
+      console.log("→ sending to Discord", {
+        seller: s.sellerName || s.sellerId,
+        productName: s.productName
+      });
+
       const { channelId, messageId, offerPrice } = await sendOfferMessageGateway({
         orderRecId,
         orderHumanId,
         sellerId: s.sellerId,
         sellerName: s.sellerName,
         inventoryRecordId: s.inventoryRecordId,
+        productName: s.productName || null,   // ← pass it through
         sku,
         size,
         suggested: s.sellingPriceSuggested,
@@ -81,12 +85,10 @@ app.post("/offers", async (req, res) => {
 // 404
 app.use((req, res) => res.status(404).json({ error: "Not found" }));
 
-/** Start everything */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("HTTP listening on :" + PORT));
 
-/** Initialize Discord first, then attach the interaction handler */
-const client = await initDiscord();
+await initDiscord();
 
 await onButtonInteraction(async ({ action, orderRecId, sellerId, inventoryRecordId, offerPrice, channelId, messageId }) => {
   try {
@@ -97,9 +99,9 @@ await onButtonInteraction(async ({ action, orderRecId, sellerId, inventoryRecord
     }
 
     if (action === "confirm") {
+      await linkInventoryToOrder(inventoryRecordId, orderRecId);
       await setInventorySold(inventoryRecordId, offerPrice);
       await setOrderMatched(orderRecId);
-      await linkInventoryToOrder(inventoryRecordId, orderRecId);
 
       const msgs = await listOfferMessagesForOrder(orderRecId);
       await Promise.allSettled(
