@@ -1,23 +1,114 @@
+// server.js
 import express from "express";
 import morgan from "morgan";
-import { InteractionType, InteractionResponseType } from "discord-interactions";
-import { verifyDiscordRequest, sendOfferMessage, disableMessageButtons } from "./lib/discord.js";
-import { setInventorySold, setOrderMatched, isOrderAlreadyMatched, logOfferMessage, listOfferMessagesForOrder } from "./lib/airtable.js";
+import { InteractionType, InteractionResponseType, verifyKey } from "discord-interactions";
+import { sendOfferMessage, disableMessageButtons } from "./lib/discord.js";
+import {
+  setInventorySold,
+  setOrderMatched,
+  isOrderAlreadyMatched,
+  logOfferMessage,
+  listOfferMessagesForOrder,
+} from "./lib/airtable.js";
 
 const app = express();
-
-// Standard body parsers for normal routes
 app.use(morgan("combined"));
-app.use(express.json({ limit: "1mb" }));
-app.use(express.urlencoded({ extended: true }));
 
+/**
+ * Health
+ */
 app.get("/", (req, res) => {
   res.type("text/plain").send("Consignment Discord bot is running.");
 });
 
 /**
- * Airtable → Offers
- * Body: your payload (order + sellers[])
+ * Discord Interactions — MUST verify signature on the RAW body.
+ * Do NOT have any global body parsers before this route.
+ */
+const interactionsJson = express.json({
+  verify: (req, res, buf) => {
+    const sig = req.get("X-Signature-Ed25519");
+    const ts  = req.get("X-Signature-Timestamp");
+    const pub = process.env.DISCORD_PUBLIC_KEY;
+    const ok  = verifyKey(buf, sig, ts, pub);
+    if (!ok) {
+      console.error("❌ Invalid Discord signature");
+      res.status(401).send("invalid request signature");
+      // Throw to stop Express from continuing
+      throw new Error("Invalid Discord signature");
+    }
+  },
+});
+
+app.post("/interactions", interactionsJson, async (req, res) => {
+  const i = req.body;
+
+  // PING (Discord uses this to verify your endpoint)
+  if (i.type === InteractionType.PING) {
+    console.log("✅ Discord PING");
+    return res.send({ type: 1 });
+  }
+
+  if (i.type === InteractionType.MESSAGE_COMPONENT) {
+    // custom_id = action|orderRecId|sellerId|inventoryRecordId|offerPrice
+    const [action, orderRecId, sellerId, inventoryRecordId, offerPriceStr] =
+      String(i.data.custom_id).split("|");
+    const offerPrice = Number(offerPriceStr);
+    const channelId  = i.channel_id;
+    const messageId  = i.message?.id;
+
+    // If already matched → reply ephemeral
+    const already = await isOrderAlreadyMatched(orderRecId);
+    if (already) {
+      return res.send({
+        type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
+        data: { content: "⛔ This order is already matched.", flags: 64 },
+      });
+    }
+
+    // ACK immediately; do work async
+    res.send({ type: InteractionResponseType.DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE });
+
+    try {
+      if (action === "confirm") {
+        await setInventorySold(inventoryRecordId, offerPrice);
+        await setOrderMatched(orderRecId);
+
+        const msgs = await listOfferMessagesForOrder(orderRecId);
+        await Promise.allSettled(
+          msgs.map(m =>
+            disableMessageButtons(
+              m.channelId,
+              m.messageId,
+              `✅ Matched by ${sellerId}. Offers closed.`
+            )
+          )
+        );
+      } else if (action === "deny") {
+        await disableMessageButtons(
+          channelId,
+          messageId,
+          `❌ ${sellerId} denied / not available.`
+        );
+      }
+    } catch (err) {
+      console.error("Interaction handling error:", err);
+    }
+    return;
+  }
+
+  // default
+  res.send({ type: 1 });
+});
+
+/**
+ * Normal parsers for all OTHER routes go AFTER /interactions
+ */
+app.use(express.json({ limit: "1mb" }));
+app.use(express.urlencoded({ extended: true }));
+
+/**
+ * Airtable → Offers (order + sellers[])
  */
 app.post("/offers", async (req, res) => {
   try {
@@ -46,12 +137,14 @@ app.post("/offers", async (req, res) => {
         size,
         suggested: s.sellingPriceSuggested,
         target,
-        max
+        max,
       });
 
-      // Compute offer price same way as in sendOfferMessage
-      const inBetween = [s.sellingPriceSuggested, target, max].every(n => typeof n === "number") &&
-                        s.sellingPriceSuggested >= target && s.sellingPriceSuggested <= max;
+      const inBetween =
+        [s.sellingPriceSuggested, target, max].every(n => typeof n === "number") &&
+        s.sellingPriceSuggested >= target &&
+        s.sellingPriceSuggested <= max;
+
       const offerPrice = inBetween ? s.sellingPriceSuggested : max;
 
       await logOfferMessage({
@@ -60,7 +153,7 @@ app.post("/offers", async (req, res) => {
         inventoryRecordId: s.inventoryRecordId,
         channelId: msg.channel_id,
         messageId: msg.id,
-        offerPrice
+        offerPrice,
       });
 
       results.push({ sellerId: s.sellerId, messageId: msg.id });
@@ -72,71 +165,6 @@ app.post("/offers", async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
-
-/**
- * Discord Interactions (button clicks)
- * Set Discord "Interactions Endpoint URL" to: https://<your-app>.onrender.com/interactions
- * Needs RAW body to verify signature, then we parse JSON.
- */
-app.post(
-  "/interactions",
-  express.raw({ type: "*/*" }),
-  (req, res, next) => {
-    try { verifyDiscordRequest(process.env.DISCORD_PUBLIC_KEY)(req, res, req.body); next(); }
-    catch (e) { /* verifyDiscordRequest already responded 401 */ }
-  },
-  express.json(),
-  async (req, res) => {
-    const i = req.body;
-
-    if (i.type === InteractionType.PING) {
-      return res.send({ type: 1 });
-    }
-
-    if (i.type === InteractionType.MESSAGE_COMPONENT) {
-      // custom_id = action|orderRecId|sellerId|inventoryRecordId|offerPrice
-      const [action, orderRecId, sellerId, inventoryRecordId, offerPriceStr] = String(i.data.custom_id).split("|");
-      const offerPrice = Number(offerPriceStr);
-      const channelId = i.channel_id;
-      const messageId = i.message?.id;
-
-      // Idempotency: if already matched, reply ephemeral
-      const already = await isOrderAlreadyMatched(orderRecId);
-      if (already) {
-        return res.send({
-          type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-          data: { content: "⛔ This order is already matched.", flags: 64 }
-        });
-      }
-
-      // ACK now; do heavy work after
-      res.send({ type: InteractionResponseType.DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE });
-
-      try {
-        if (action === "confirm") {
-          // 1) Update Inventory record: sold + final price
-          await setInventorySold(inventoryRecordId, offerPrice);
-          // 2) Mark Order as Matched
-          await setOrderMatched(orderRecId);
-          // 3) Disable ALL offer messages for this order
-          const msgs = await listOfferMessagesForOrder(orderRecId);
-          await Promise.allSettled(
-            msgs.map(m => disableMessageButtons(m.channelId, m.messageId, `✅ Matched by ${sellerId}. Offers closed.`))
-          );
-        } else if (action === "deny") {
-          // Disable just this message
-          await disableMessageButtons(channelId, messageId, `❌ ${sellerId} denied / not available.`);
-        }
-      } catch (e) {
-        console.error("Interaction handling error:", e);
-      }
-      return;
-    }
-
-    // default
-    res.send({ type: 1 });
-  }
-);
 
 // 404
 app.use((req, res) => res.status(404).json({ error: "Not found" }));
