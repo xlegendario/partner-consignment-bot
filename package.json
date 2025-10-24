@@ -9,7 +9,7 @@
     "dev": "NODE_ENV=development node server.js"
   },
   "dependencies": {
-    "discord-interactions": "^4.0.0",
+    "discord.js": "^14.16.3",
     "express": "^4.19.2",
     "morgan": "^1.10.0",
     "node-fetch": "^3.3.2"
