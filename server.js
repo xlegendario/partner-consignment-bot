@@ -14,6 +14,9 @@ import {
 const app = express();
 app.use(morgan("combined"));
 
+// Log PK suffix at boot to ensure we're using the right app's public key
+console.log("DISCORD_PUBLIC_KEY suffix:", (process.env.DISCORD_PUBLIC_KEY || "").slice(-8));
+
 /**
  * Health
  */
@@ -23,33 +26,39 @@ app.get("/", (req, res) => {
 
 /**
  * Discord Interactions — MUST verify signature on the RAW body.
- * Do NOT have any global body parsers before this route.
+ * Do NOT have any global body parsers before these routes.
  */
 const interactionsJson = express.json({
   verify: (req, res, buf) => {
     const sig = req.get("X-Signature-Ed25519");
     const ts  = req.get("X-Signature-Timestamp");
     const pub = process.env.DISCORD_PUBLIC_KEY;
+
+    // Small debug to see Discord headers
+    // (safe to keep; doesn't log secrets)
+    // console.log("INT headers:", "sig.len", sig ? sig.length : 0, "ts", ts);
+
     const ok  = verifyKey(buf, sig, ts, pub);
     if (!ok) {
       console.error("❌ Invalid Discord signature");
-      res.status(401).send("invalid request signature");
-      // Throw to stop Express from continuing
+      res.status(401).type("text/plain").send("invalid request signature");
       throw new Error("Invalid Discord signature");
     }
   },
 });
 
+// Primary interactions endpoint
 app.post("/interactions", interactionsJson, async (req, res) => {
   const i = req.body;
 
   // PING (Discord uses this to verify your endpoint)
-  if (i.type === InteractionType.PING) {
-    console.log("✅ Discord PING");
-    return res.send({ type: 1 });
+  if (i?.type === InteractionType.PING) {
+    console.log("✅ Discord PING (/interactions)");
+    res.set("Content-Type", "application/json");
+    return res.status(200).send('{"type":1}');
   }
 
-  if (i.type === InteractionType.MESSAGE_COMPONENT) {
+  if (i?.type === InteractionType.MESSAGE_COMPONENT) {
     // custom_id = action|orderRecId|sellerId|inventoryRecordId|offerPrice
     const [action, orderRecId, sellerId, inventoryRecordId, offerPriceStr] =
       String(i.data.custom_id).split("|");
@@ -60,14 +69,16 @@ app.post("/interactions", interactionsJson, async (req, res) => {
     // If already matched → reply ephemeral
     const already = await isOrderAlreadyMatched(orderRecId);
     if (already) {
-      return res.send({
+      res.set("Content-Type", "application/json");
+      return res.status(200).send(JSON.stringify({
         type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-        data: { content: "⛔ This order is already matched.", flags: 64 },
-      });
+        data: { content: "⛔ This order is already matched.", flags: 64 }
+      }));
     }
 
     // ACK immediately; do work async
-    res.send({ type: InteractionResponseType.DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE });
+    res.set("Content-Type", "application/json");
+    res.status(200).send('{"type":5}'); // DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE
 
     try {
       if (action === "confirm") {
@@ -97,8 +108,24 @@ app.post("/interactions", interactionsJson, async (req, res) => {
     return;
   }
 
-  // default
-  res.send({ type: 1 });
+  // default no-op ACK
+  res.set("Content-Type", "application/json");
+  return res.status(200).send('{"type":1}');
+});
+
+// Alternate interactions endpoint (sometimes the portal prefers a different path)
+app.post("/discord/interactions", interactionsJson, async (req, res) => {
+  const i = req.body;
+
+  if (i?.type === InteractionType.PING) {
+    console.log("✅ Discord PING (/discord/interactions)");
+    res.set("Content-Type", "application/json");
+    return res.status(200).send('{"type":1}');
+  }
+
+  // Just ACK for now; if you want, you can duplicate the component logic here too.
+  res.set("Content-Type", "application/json");
+  return res.status(200).send('{"type":1}');
 });
 
 /**
