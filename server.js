@@ -104,7 +104,7 @@ app.post("/disable-offers", async (req, res) => {
         disableMessageButtonsGateway(
           m.channelId,
           m.messageId,
-          `✅ Order externally marked as matched. Offers closed.`
+          `✅ Another seller matched. Offers closed.`
         )
       )
     );
