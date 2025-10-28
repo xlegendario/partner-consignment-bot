@@ -82,6 +82,41 @@ app.post("/offers", async (req, res) => {
   }
 });
 
+/**
+ * External webhook to disable offers if order becomes matched externally.
+ * Example body: { orderRecId: "recXXXXXXXX", reason: "Fulfilled manually" }
+ */
+app.post("/disable-offers", async (req, res) => {
+  try {
+    const { orderRecId, reason } = req.body || {};
+    if (!orderRecId) return res.status(400).json({ error: "Missing orderRecId" });
+
+    console.log(`🔄 External disable for order ${orderRecId} — reason: ${reason || "unknown"}`);
+
+    // Fetch all Discord messages logged for that order
+    const msgs = await listOfferMessagesForOrder(orderRecId);
+    if (!msgs?.length) {
+      return res.json({ ok: true, message: "No messages found for this order." });
+    }
+
+    await Promise.allSettled(
+      msgs.map(m =>
+        disableMessageButtonsGateway(
+          m.channelId,
+          m.messageId,
+          `✅ Order externally marked as matched. Offers closed.`
+        )
+      )
+    );
+
+    res.json({ ok: true, disabled: msgs.length });
+  } catch (err) {
+    console.error("Error in /disable-offers:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
 // 404
 app.use((req, res) => res.status(404).json({ error: "Not found" }));
 
