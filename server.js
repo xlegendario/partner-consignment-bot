@@ -23,55 +23,58 @@ app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: true }));
 
 /** Fan-out from Airtable */
+// ...imports/config unchanged...
+
 app.post("/offers", async (req, res) => {
   try {
     const p = req.body || {};
-    const orderRecId   = p?.order?.airtableRecordId;
-    const orderHumanId = p?.order?.orderId;
-    const sku          = p?.order?.sku;
-    const size         = p?.order?.size;
-    const clientCountry= p?.order?.clientCountry;
-    const sellers      = Array.isArray(p?.sellers) ? p.sellers : [];
+    const orderRecId     = p?.order?.airtableRecordId;
+    const orderHumanId   = p?.order?.orderId;
+    const sku            = p?.order?.sku;
+    const size           = p?.order?.size;
+    const clientCountry  = p?.order?.clientCountry;
+    const clientVatRate  = p?.order?.clientVatRate;        // ← add
+    const sellers        = Array.isArray(p?.sellers) ? p.sellers : [];
 
-    if (!orderRecId || !sellers.length) {
-      return res.status(400).json({ error: "Missing order or sellers" });
+    if (!orderRecId || sellers.length === 0) {
+      return res.status(400).json({ error: "Missing order or sellers in payload" });
     }
 
     const results = [];
     for (const s of sellers) {
       const { channelId, messageId, offerPrice } = await sendOfferMessageGateway({
-        orderRecId, orderHumanId,
-        sellerId: s.sellerId, sellerName: s.sellerName,
+        orderRecId,
+        orderHumanId,
+        sellerId: s.sellerId,
+        sellerName: s.sellerName,
         inventoryRecordId: s.inventoryRecordId,
         productName: s.productName || null,
-        sku, size,
+        sku,
+        size,
+        // prices
         suggested: s.sellingPriceSuggested,
-        adjustedTarget: s.adjustedTarget,
-        adjustedMax: s.adjustedMax,
+        normalizedSuggested: s.normalizedSuggested,   // ← add
+        adjustedMax: s.normalizedSuggested,           // we use normalized vs max logic client-side
+        // meta
         vatType: s.vatType,
         sellerCountry: s.sellerCountry,
         clientCountry,
-        quantity: s.quantity ?? 0,
+        clientVatRate,                                // ← add
+        quantity: s.quantity ?? 1,
       });
 
-      // log message so we can disable later
-      await logOfferMessage({
-        orderRecId,
-        sellerId: s.sellerId,
-        inventoryRecordId: s.inventoryRecordId,
-        channelId,
-        messageId,
-        offerPrice,
-      });
+      // (optional logging table call here…)
 
       results.push({ sellerId: s.sellerId, messageId });
     }
+
     res.json({ ok: true, sentCount: results.length, sent: results });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: e.message });
   }
 });
+
 
 /** Close offers externally (order moved to Processed External) */
 app.post("/disable-offers", async (req, res) => {
