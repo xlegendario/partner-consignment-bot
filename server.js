@@ -29,35 +29,19 @@ app.use(express.urlencoded({ extended: true }));
 app.post("/offers", async (req, res) => {
   try {
     const p = req.body || {};
-    const orderRecId   = p?.order?.airtableRecordId;
-    const orderHumanId = p?.order?.orderId;
-    const sku          = p?.order?.sku;
-    const size         = p?.order?.size;
-    const target       = p?.order?.targetBuyingPrice;
-    const max          = p?.order?.maximumBuyingPrice;
-    const sellers      = Array.isArray(p?.sellers) ? p.sellers : [];
+    const orderRecId     = p?.order?.airtableRecordId;
+    const orderHumanId   = p?.order?.orderId;
+    const sku            = p?.order?.sku;
+    const size           = p?.order?.size;
+    const clientCountry  = p?.order?.clientCountry;   // 👈 NEW (for labels)
+    const sellers        = Array.isArray(p?.sellers) ? p.sellers : [];
 
     if (!orderRecId || sellers.length === 0) {
       return res.status(400).json({ error: "Missing order or sellers in payload" });
     }
 
     const results = [];
-
     for (const s of sellers) {
-      // Prefer seller-specific VAT-adjusted targets/max, fallback to order-level
-      const adjTarget = typeof s.adjustedTarget === "number" ? s.adjustedTarget : target;
-      const adjMax    = typeof s.adjustedMax === "number" ? s.adjustedMax : max;
-
-      console.log("→ sending to Discord", {
-        seller: s.sellerName || s.sellerId,
-        productName: s.productName,
-        vatType: s.vatType,
-        sellerCountry: s.sellerCountry,
-        adjTarget,
-        adjMax,
-      });
-
-      // Send to Discord (this builds the embed)
       const { channelId, messageId, offerPrice } = await sendOfferMessageGateway({
         orderRecId,
         orderHumanId,
@@ -68,11 +52,14 @@ app.post("/offers", async (req, res) => {
         sku,
         size,
         suggested: s.sellingPriceSuggested,
-        target: adjTarget,
-        max: adjMax,
+        // 👇 NEW fields coming from Airtable
+        adjustedTarget: s.adjustedTarget,
+        adjustedMax: s.adjustedMax,
+        vatType: s.vatType,
+        sellerCountry: s.sellerCountry,
+        clientCountry,
       });
 
-      // Log result in Airtable
       await logOfferMessage({
         orderRecId,
         sellerId: s.sellerId,
