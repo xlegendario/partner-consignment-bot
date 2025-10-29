@@ -24,17 +24,8 @@ app.get("/health", (_req, res) => res.json({ ok: true, ts: new Date().toISOStrin
 app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: true }));
 
-/**
- * Fan-out from Airtable: for each matched seller, post either an offer-request
- * or a confirmation-request, based on VAT-normalized prices coming from Airtable.
- *
- * REQUIRED from Airtable payload per seller:
- *  - sellingPriceSuggested (raw)
- *  - normalizedSuggested   (suggested normalized to comparison basis)
- *  - normalizedMax         (Max Buying Price normalized to same basis)
- *  - vatType, sellerCountry, sellerVatRatePct (optional but recommended)
- *  - quantity (optional; defaults to 1)
- */
+const fmt2 = v => (typeof v === "number" && isFinite(v) ? v.toFixed(2) : null);
+
 app.post("/offers", async (req, res) => {
   try {
     const p = req.body || {};
@@ -50,7 +41,26 @@ app.post("/offers", async (req, res) => {
 
     const results = [];
     for (const s of sellers) {
-      const payload = {
+      // normalizedSuggested / normalizedMax expected from Airtable
+      const suggested    = s.normalizedSuggested ?? s.sellingPriceSuggested ?? null;
+      const adjustedMax  =
+        s.normalizedMax ??
+        s.maxBuyNormalized ??
+        s.adjustedMax ??
+        p?.order?.maxBuyNormalized ??  // accept from order if you send it
+        null;
+
+      // DEBUG: see exactly what we got per seller
+      console.log("[fanout]", {
+        seller: s.sellerName || s.sellerId,
+        suggested,
+        adjustedMax,
+        vatType: s.vatType,
+        sellerCountry: s.sellerCountry,
+        qty: s.quantity
+      });
+
+      const { channelId, messageId, offerPrice } = await sendOfferMessageGateway({
         orderRecId,
         orderHumanId,
         sellerId: s.sellerId,
@@ -61,26 +71,20 @@ app.post("/offers", async (req, res) => {
         size,
         quantity: s.quantity ?? 1,
 
-        // Prices
-        suggested: s.normalizedSuggested ?? s.sellingPriceSuggested ?? null,
-        adjustedMax:
-          s.normalizedMax ??
-          s.adjustedMax ??
-          s.maxBuyNormalized ??
-          null,
+        // prices
+        suggested,
+        adjustedMax,
 
         // VAT meta for labels
         vatType: s.vatType || null,
         sellerCountry: s.sellerCountry || "",
-        sellerVatRatePct: s.sellerVatRatePct ?? 21, // % number (e.g. 21)
+        sellerVatRatePct: s.sellerVatRatePct ?? 21,
 
-        // We (buyer) are NL — used only for display tags in the embed
+        // buyer (us) is NL — used only for label tag
         clientCountry: "Netherlands",
-      };
+      });
 
-      const { channelId, messageId, offerPrice } = await sendOfferMessageGateway(payload);
-
-      // best-effort logging; ignore errors
+      // optional best-effort log
       try {
         await logOfferMessage({
           orderRecId,
@@ -92,6 +96,9 @@ app.post("/offers", async (req, res) => {
         });
       } catch (_) {}
 
+      console.log(
+        `[discord] posted to ${s.sellerName || s.sellerId} – suggested=${fmt2(suggested)} max=${fmt2(adjustedMax)}`
+      );
       results.push({ sellerId: s.sellerId, messageId });
     }
 
