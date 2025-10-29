@@ -42,27 +42,37 @@ app.post("/offers", async (req, res) => {
     }
 
     const results = [];
+
     for (const s of sellers) {
-      // log to prove we received productName
+      // Prefer seller-specific VAT-adjusted targets/max, fallback to order-level
+      const adjTarget = typeof s.adjustedTarget === "number" ? s.adjustedTarget : target;
+      const adjMax    = typeof s.adjustedMax === "number" ? s.adjustedMax : max;
+
       console.log("→ sending to Discord", {
         seller: s.sellerName || s.sellerId,
-        productName: s.productName
+        productName: s.productName,
+        vatType: s.vatType,
+        sellerCountry: s.sellerCountry,
+        adjTarget,
+        adjMax,
       });
 
+      // Send to Discord (this builds the embed)
       const { channelId, messageId, offerPrice } = await sendOfferMessageGateway({
         orderRecId,
         orderHumanId,
         sellerId: s.sellerId,
         sellerName: s.sellerName,
         inventoryRecordId: s.inventoryRecordId,
-        productName: s.productName || null,   // ← pass it through
+        productName: s.productName || null,
         sku,
         size,
         suggested: s.sellingPriceSuggested,
-        target,
-        max,
+        target: adjTarget,
+        max: adjMax,
       });
 
+      // Log result in Airtable
       await logOfferMessage({
         orderRecId,
         sellerId: s.sellerId,
@@ -81,6 +91,7 @@ app.post("/offers", async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+
 
 /**
  * External webhook to disable offers if order becomes matched externally.
