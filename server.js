@@ -8,8 +8,10 @@ import {
   disableMessageButtonsGateway,
 } from "./lib/discord.js";
 import {
+  // optional: log rows per message; safe to keep wrapped in try/catch
   logOfferMessage,
   listOfferMessagesForOrder,
+  // creates a Sales row and decrements Inventory.{Quantity} by 1
   createSaleAndDecrement,
 } from "./lib/airtable.js";
 
@@ -23,40 +25,32 @@ app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: true }));
 
 /**
- * Payload from Airtable:
- * {
- *   order: {
- *     airtableRecordId, orderId, sku, size,
- *     targetBuyingPrice, maximumBuyingPrice,
- *     clientCountry, clientVatRate
- *   },
- *   sellers: [{
- *     sellerId, sellerName, inventoryRecordId,
- *     productName, sellingPriceSuggested,
- *     vatType, sellerCountry, quantity
- *   }, ...]
- * }
+ * Fan-out from Airtable: for each matched seller, post either an offer-request
+ * or a confirmation-request, based on VAT-normalized prices coming from Airtable.
+ *
+ * REQUIRED from Airtable payload per seller:
+ *  - sellingPriceSuggested (raw)
+ *  - normalizedSuggested   (suggested normalized to comparison basis)
+ *  - normalizedMax         (Max Buying Price normalized to same basis)
+ *  - vatType, sellerCountry, sellerVatRatePct (optional but recommended)
+ *  - quantity (optional; defaults to 1)
  */
 app.post("/offers", async (req, res) => {
   try {
     const p = req.body || {};
-    const orderRecId     = p?.order?.airtableRecordId;
-    const orderHumanId   = p?.order?.orderId;
-    const sku            = p?.order?.sku;
-    const size           = p?.order?.size;
-    const target         = p?.order?.targetBuyingPrice;
-    const max            = p?.order?.maximumBuyingPrice;
-    const clientCountry  = p?.order?.clientCountry;
-    const clientVatRate  = p?.order?.clientVatRate;
-    const sellers        = Array.isArray(p?.sellers) ? p.sellers : [];
+    const orderRecId   = p?.order?.airtableRecordId;
+    const orderHumanId = p?.order?.orderId || null;
+    const sku          = p?.order?.sku || null;
+    const size         = p?.order?.size || null;
+    const sellers      = Array.isArray(p?.sellers) ? p.sellers : [];
 
-    if (!orderRecId || !sku || !size || sellers.length === 0) {
-      return res.status(400).json({ error: "Missing order basics or sellers" });
+    if (!orderRecId || sellers.length === 0) {
+      return res.status(400).json({ error: "Missing order or sellers in payload" });
     }
 
     const results = [];
     for (const s of sellers) {
-      const { channelId, messageId, offerPrice } = await sendOfferMessageGateway({
+      const payload = {
         orderRecId,
         orderHumanId,
         sellerId: s.sellerId,
@@ -65,25 +59,38 @@ app.post("/offers", async (req, res) => {
         productName: s.productName || null,
         sku,
         size,
-        suggested: s.sellingPriceSuggested,
-        target,
-        max,
-        vatType: s.vatType,
-        sellerCountry: s.sellerCountry,
-        clientCountry,
-        clientVatRate,
         quantity: s.quantity ?? 1,
-      });
 
-      // log message so we can disable later
-      await logOfferMessage({
-        orderRecId,
-        sellerId: s.sellerId,
-        inventoryRecordId: s.inventoryRecordId,
-        channelId,
-        messageId,
-        offerPrice,
-      });
+        // Prices
+        suggested: s.normalizedSuggested ?? s.sellingPriceSuggested ?? null,
+        adjustedMax:
+          s.normalizedMax ??
+          s.adjustedMax ??
+          s.maxBuyNormalized ??
+          null,
+
+        // VAT meta for labels
+        vatType: s.vatType || null,
+        sellerCountry: s.sellerCountry || "",
+        sellerVatRatePct: s.sellerVatRatePct ?? 21, // % number (e.g. 21)
+
+        // We (buyer) are NL — used only for display tags in the embed
+        clientCountry: "Netherlands",
+      };
+
+      const { channelId, messageId, offerPrice } = await sendOfferMessageGateway(payload);
+
+      // best-effort logging; ignore errors
+      try {
+        await logOfferMessage({
+          orderRecId,
+          sellerId: s.sellerId,
+          inventoryRecordId: s.inventoryRecordId,
+          channelId,
+          messageId,
+          offerPrice,
+        });
+      } catch (_) {}
 
       results.push({ sellerId: s.sellerId, messageId });
     }
@@ -95,7 +102,10 @@ app.post("/offers", async (req, res) => {
   }
 });
 
-/** Close all buttons for an order (e.g., order moved to “Processed External”). */
+/**
+ * External close hook (e.g., order moved to “Processed External” in Airtable)
+ * Body: { orderRecId: "recXXXX", reason?: "string" }
+ */
 app.post("/disable-offers", async (req, res) => {
   try {
     const { orderRecId, reason } = req.body || {};
@@ -107,7 +117,7 @@ app.post("/disable-offers", async (req, res) => {
         disableMessageButtonsGateway(
           m.channelId,
           m.messageId,
-          `✅ ${reason || "Closed"}. Offers disabled.`
+          `✅ ${reason || "Order closed"}. Offers disabled.`
         )
       )
     );
@@ -118,18 +128,19 @@ app.post("/disable-offers", async (req, res) => {
   }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("HTTP listening on :" + PORT));
-
-/** Button interactions */
+/** Discord button interactions */
 await initDiscord();
 await onButtonInteraction(async ({ action, orderRecId, sellerId, inventoryRecordId, offerPrice }) => {
   try {
     if (action === "confirm") {
-      // 1) Create Sales row + decrement Inventory.Quantity by 1
-      await createSaleAndDecrement({ inventoryId: inventoryRecordId, orderRecId, finalPrice: offerPrice });
+      // 1) Create a Sales row + decrement Inventory.Quantity by 1
+      await createSaleAndDecrement({
+        inventoryId: inventoryRecordId,
+        orderRecId,
+        finalPrice: offerPrice,
+      });
 
-      // 2) Disable ALL messages belonging to this order
+      // 2) Disable ALL messages for this order
       const msgs = await listOfferMessagesForOrder(orderRecId);
       await Promise.allSettled(
         msgs.map(m =>
@@ -141,7 +152,7 @@ await onButtonInteraction(async ({ action, orderRecId, sellerId, inventoryRecord
         )
       );
     } else if (action === "deny") {
-      // Optional: disable all, or only the one message. We disable all for clarity.
+      // (You can choose to disable only this one; here we disable all for clarity)
       const msgs = await listOfferMessagesForOrder(orderRecId);
       await Promise.allSettled(
         msgs.map(m =>
@@ -153,7 +164,10 @@ await onButtonInteraction(async ({ action, orderRecId, sellerId, inventoryRecord
         )
       );
     }
-  } catch (err) {
-    console.error("Interaction handling error:", err);
+  } catch (e) {
+    console.error("Interaction handling error:", e);
   }
 });
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log("HTTP listening on :" + PORT));
