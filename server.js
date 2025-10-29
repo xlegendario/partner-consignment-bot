@@ -15,23 +15,23 @@ import {
 
 const app = express();
 app.use(morgan("combined"));
+app.use(express.json({ limit: "1mb" }));
+app.use(express.urlencoded({ extended: true }));
 
 app.get("/", (_req, res) => res.type("text/plain").send("Consignment bot OK"));
 app.get("/health", (_req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
 
-app.use(express.json({ limit: "1mb" }));
-
-/** ============ Fan-out from Airtable ============ */
+/** Fan-out from Airtable */
 app.post("/offers", async (req, res) => {
   try {
     const p = req.body || {};
-    const orderRecId    = p?.order?.airtableRecordId;
-    const orderHumanId  = p?.order?.orderId;
-    const sku           = p?.order?.sku;
-    const size          = p?.order?.size;
-    const clientCountry = p?.order?.clientCountry;
-    const clientVatRate = p?.order?.clientVatRate;     // % number
-    const sellers       = Array.isArray(p?.sellers) ? p.sellers : [];
+    const orderRecId     = p?.order?.airtableRecordId;
+    const orderHumanId   = p?.order?.orderId;
+    const sku            = p?.order?.sku;
+    const size           = p?.order?.size;
+    const clientCountry  = p?.order?.clientCountry;
+    const clientVatRate  = p?.order?.clientVatRate;
+    const sellers        = Array.isArray(p?.sellers) ? p.sellers : [];
 
     if (!orderRecId || sellers.length === 0) {
       return res.status(400).json({ error: "Missing order or sellers in payload" });
@@ -39,7 +39,6 @@ app.post("/offers", async (req, res) => {
 
     const results = [];
     for (const s of sellers) {
-      // IMPORTANT: adjustedMax must come from Airtable’s normalized max
       const { channelId, messageId, offerPrice } = await sendOfferMessageGateway({
         orderRecId,
         orderHumanId,
@@ -49,19 +48,18 @@ app.post("/offers", async (req, res) => {
         productName: s.productName || null,
         sku,
         size,
-        // prices
-        suggested: s.sellingPriceSuggested,     // original ask
-        normalizedSuggested: s.normalizedSuggested, // ask normalized to gross when required
-        adjustedMax: s.adjustedMax,             // ✅ your VAT-normalized MAX (from Airtable)
-        // meta
+        quantity: s.quantity ?? 1,
+        // normalized comparison values coming from Airtable:
+        normalizedSuggested: s.normalizedSuggested,
+        normalizedTarget:    s.normalizedTarget,
+        normalizedMax:       s.normalizedMax,
+        // labels/meta
         vatType: s.vatType,
         sellerCountry: s.sellerCountry,
         clientCountry,
         clientVatRate,
-        quantity: s.quantity ?? 1,
       });
 
-      // Log so we can disable later via /disable-offers
       await logOfferMessage({
         orderRecId,
         sellerId: s.sellerId,
@@ -81,7 +79,7 @@ app.post("/offers", async (req, res) => {
   }
 });
 
-/** ============ Close offers externally (order moved to Processed External) ============ */
+/** Close offers externally (e.g., order → Processed External) */
 app.post("/disable-offers", async (req, res) => {
   try {
     const { orderRecId, reason } = req.body || {};
@@ -97,7 +95,6 @@ app.post("/disable-offers", async (req, res) => {
         )
       )
     );
-
     res.json({ ok: true, disabled: msgs.length });
   } catch (e) {
     console.error("disable-offers error:", e);
@@ -105,7 +102,7 @@ app.post("/disable-offers", async (req, res) => {
   }
 });
 
-/** ============ Button interactions ============ */
+/** Button interactions */
 await initDiscord();
 await onButtonInteraction(async ({ action, orderRecId, sellerId, inventoryRecordId, offerPrice, channelId, messageId }) => {
   try {
@@ -125,7 +122,7 @@ await onButtonInteraction(async ({ action, orderRecId, sellerId, inventoryRecord
         )
       );
     } else if (action === "deny") {
-      // Disable only the pressed message
+      // Only disable the clicked message (you can broaden this if you want)
       await disableMessageButtonsGateway(
         channelId,
         messageId,
