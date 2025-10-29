@@ -8,58 +8,53 @@ import {
   onButtonInteraction
 } from "./lib/discord.js";
 import {
-  setInventorySold,
-  setOrderMatched,
-  isOrderAlreadyMatched,
   logOfferMessage,
   listOfferMessagesForOrder,
-  linkInventoryToOrder
+  createSaleAndDecrement,
 } from "./lib/airtable.js";
 
 const app = express();
 app.use(morgan("combined"));
 
-app.get("/", (req, res) => {
-  res.type("text/plain").send("Consignment Discord bot is running (gateway mode).");
-});
+app.get("/", (_req, res) => res.type("text/plain").send("Consignment bot OK"));
+app.get("/health", (_req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
 
 app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: true }));
 
+/** Fan-out from Airtable */
 app.post("/offers", async (req, res) => {
   try {
     const p = req.body || {};
-    const orderRecId     = p?.order?.airtableRecordId;
-    const orderHumanId   = p?.order?.orderId;
-    const sku            = p?.order?.sku;
-    const size           = p?.order?.size;
-    const clientCountry  = p?.order?.clientCountry;   // 👈 NEW (for labels)
-    const sellers        = Array.isArray(p?.sellers) ? p.sellers : [];
+    const orderRecId   = p?.order?.airtableRecordId;
+    const orderHumanId = p?.order?.orderId;
+    const sku          = p?.order?.sku;
+    const size         = p?.order?.size;
+    const clientCountry= p?.order?.clientCountry;
+    const sellers      = Array.isArray(p?.sellers) ? p.sellers : [];
 
-    if (!orderRecId || sellers.length === 0) {
-      return res.status(400).json({ error: "Missing order or sellers in payload" });
+    if (!orderRecId || !sellers.length) {
+      return res.status(400).json({ error: "Missing order or sellers" });
     }
 
     const results = [];
     for (const s of sellers) {
       const { channelId, messageId, offerPrice } = await sendOfferMessageGateway({
-        orderRecId,
-        orderHumanId,
-        sellerId: s.sellerId,
-        sellerName: s.sellerName,
+        orderRecId, orderHumanId,
+        sellerId: s.sellerId, sellerName: s.sellerName,
         inventoryRecordId: s.inventoryRecordId,
         productName: s.productName || null,
-        sku,
-        size,
+        sku, size,
         suggested: s.sellingPriceSuggested,
-        // 👇 NEW fields coming from Airtable
         adjustedTarget: s.adjustedTarget,
         adjustedMax: s.adjustedMax,
         vatType: s.vatType,
         sellerCountry: s.sellerCountry,
         clientCountry,
+        quantity: s.quantity ?? 0,
       });
 
+      // log message so we can disable later
       await logOfferMessage({
         orderRecId,
         sellerId: s.sellerId,
@@ -71,7 +66,6 @@ app.post("/offers", async (req, res) => {
 
       results.push({ sellerId: s.sellerId, messageId });
     }
-
     res.json({ ok: true, sentCount: results.length, sent: results });
   } catch (e) {
     console.error(e);
@@ -79,81 +73,47 @@ app.post("/offers", async (req, res) => {
   }
 });
 
-
-/**
- * External webhook to disable offers if order becomes matched externally.
- * Example body: { orderRecId: "recXXXXXXXX", reason: "Fulfilled manually" }
- */
+/** Close offers externally (order moved to Processed External) */
 app.post("/disable-offers", async (req, res) => {
   try {
     const { orderRecId, reason } = req.body || {};
     if (!orderRecId) return res.status(400).json({ error: "Missing orderRecId" });
 
-    console.log(`🔄 External disable for order ${orderRecId} — reason: ${reason || "unknown"}`);
-
-    // Fetch all Discord messages logged for that order
     const msgs = await listOfferMessagesForOrder(orderRecId);
-    if (!msgs?.length) {
-      return res.json({ ok: true, message: "No messages found for this order." });
-    }
-
     await Promise.allSettled(
-      msgs.map(m =>
-        disableMessageButtonsGateway(
-          m.channelId,
-          m.messageId,
-          `✅ Another seller matched. Offers closed.`
-        )
-      )
+      msgs.map(m => disableMessageButtonsGateway(m.channelId, m.messageId, `✅ ${reason || "Closed"}. Offers disabled.`))
     );
-
     res.json({ ok: true, disabled: msgs.length });
-  } catch (err) {
-    console.error("Error in /disable-offers:", err);
-    res.status(500).json({ error: err.message });
+  } catch (e) {
+    console.error("disable-offers error:", e);
+    res.status(500).json({ error: e.message });
   }
 });
 
+/** Button interactions */
+await initDiscord();
+await onButtonInteraction(async ({ action, orderRecId, sellerId, inventoryRecordId, offerPrice }) => {
+  try {
+    if (action === "confirm") {
+      // 1) Create Sales row + decrement Quantity
+      await createSaleAndDecrement({ inventoryId: inventoryRecordId, orderRecId, finalPrice: offerPrice });
 
-// 404
-app.use((req, res) => res.status(404).json({ error: "Not found" }));
+      // 2) Disable ALL messages belonging to this order
+      const msgs = await listOfferMessagesForOrder(orderRecId);
+      await Promise.allSettled(
+        msgs.map(m => disableMessageButtonsGateway(m.channelId, m.messageId, `✅ Matched by ${sellerId}. Offers closed.`))
+      );
+    } else if (action === "deny") {
+      // We only disable *that one* msg on deny — optional to disable all
+      const msgs = await listOfferMessagesForOrder(orderRecId);
+      await Promise.allSettled(
+        msgs.map(m => disableMessageButtonsGateway(m.channelId, m.messageId, `❌ ${sellerId} denied / not available.`))
+      );
+    }
+  } catch (e) {
+    console.error("Interaction handling error:", e);
+  }
+});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("HTTP listening on :" + PORT));
-
-await initDiscord();
-
-await onButtonInteraction(async ({ action, orderRecId, sellerId, inventoryRecordId, offerPrice, channelId, messageId }) => {
-  try {
-    const already = await isOrderAlreadyMatched(orderRecId);
-    if (already) {
-      await disableMessageButtonsGateway(channelId, messageId, "⛔ Already matched. Buttons disabled.");
-      return;
-    }
-
-    if (action === "confirm") {
-      await linkInventoryToOrder(inventoryRecordId, orderRecId);
-      await setInventorySold(inventoryRecordId, offerPrice);
-      await setOrderMatched(orderRecId);
-
-      const msgs = await listOfferMessagesForOrder(orderRecId);
-      await Promise.allSettled(
-        msgs.map(m =>
-          disableMessageButtonsGateway(
-            m.channelId,
-            m.messageId,
-            `✅ Matched by ${sellerId}. Offers closed.`
-          )
-        )
-      );
-    } else if (action === "deny") {
-      await disableMessageButtonsGateway(
-        channelId,
-        messageId,
-        `❌ ${sellerId} denied / not available.`
-      );
-    }
-  } catch (err) {
-    console.error("Interaction handling error:", err);
-  }
-});
