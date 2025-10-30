@@ -11,6 +11,8 @@ import {
   logOfferMessage,
   listOfferMessagesForOrder,
   createSaleAndDecrement,
+  hasSaleForOrder,            // ← add
+  setOrderMatchedStatus,      // ← add
 } from "./lib/airtable.js";
 
 const processingOrders = new Set();
