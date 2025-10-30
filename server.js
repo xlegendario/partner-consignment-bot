@@ -28,56 +28,17 @@ const isNum = (v) => typeof v === "number" && Number.isFinite(v);
 app.post("/offers", async (req, res) => {
   try {
     const p = req.body || {};
-    const orderRecId     = p?.order?.airtableRecordId;
-    const orderHumanId   = p?.order?.orderId || null;
-    const sku            = p?.order?.sku || null;
-    const size           = p?.order?.size || null;
-
-    // optional, mainly for labels
-    const clientCountry  = p?.order?.clientCountry || "Netherlands";
-    const clientVatRate  = p?.order?.clientVatRate ?? null;
-
-    const sellers        = Array.isArray(p?.sellers) ? p.sellers : [];
-
+    const orderRecId   = p?.order?.airtableRecordId;
+    const orderHumanId = p?.order?.orderId;
+    const sku          = p?.order?.sku;
+    const size         = p?.order?.size;
+    const sellers      = Array.isArray(p?.sellers) ? p.sellers : [];
     if (!orderRecId || sellers.length === 0) {
       return res.status(400).json({ error: "Missing order or sellers in payload" });
     }
 
     const results = [];
-
     for (const s of sellers) {
-      // We expect Airtable to send normalized values after VAT logic.
-      // We still layer fallbacks to avoid blanks.
-      const suggested =
-        (isNum(s.normalizedSuggested) ? s.normalizedSuggested : null) ??
-        (isNum(s.sellingPriceSuggested) ? s.sellingPriceSuggested : null);
-
-      const adjustedMax =
-        (isNum(s.normalizedMax)        ? s.normalizedMax        : null) ??
-        (isNum(s.maxBuyNormalized)     ? s.maxBuyNormalized     : null) ??
-        (isNum(s.adjustedMax)          ? s.adjustedMax          : null) ??
-        (isNum(p?.order?.maxBuyNormalized) ? p.order.maxBuyNormalized : null);
-
-      // If adjustedMax is missing, do NOT send (prevents “blank offer”)
-      if (!isNum(adjustedMax)) {
-        console.warn("[fanout:skip] adjustedMax missing for seller", {
-          seller: s.sellerName || s.sellerId,
-          suggested, adjustedMax,
-        });
-        continue;
-      }
-
-      // Debug visibility
-      console.log("[fanout]", {
-        seller: s.sellerName || s.sellerId,
-        suggested,
-        adjustedMax,
-        vatType: s.vatType || null,
-        sellerCountry: s.sellerCountry || "",
-        qty: s.quantity ?? 1,
-      });
-
-      // Send to Discord
       const { channelId, messageId, offerPrice } = await sendOfferMessageGateway({
         orderRecId,
         orderHumanId,
@@ -87,30 +48,29 @@ app.post("/offers", async (req, res) => {
         productName: s.productName || null,
         sku,
         size,
-        // price inputs
-        suggested,
-        adjustedMax,
-        // meta for labels
-        vatType: s.vatType || null,
-        sellerCountry: s.sellerCountry || "",
-        sellerVatRatePct: s.sellerVatRatePct ?? 21,   // not used in calc here, only label if needed
-        clientCountry,                                 // we (buyer) are NL
-        clientVatRate,
+        suggested: s.normalizedSuggested ?? s.sellingPriceSuggested ?? null,
+        adjustedMax: s.normalizedMax ?? s.maxBuyNormalized ?? null,
+        vatType: s.vatType,
+        sellerCountry: s.sellerCountry,
+        clientCountry: "Netherlands",
         quantity: s.quantity ?? 1,
       });
 
-      // Best-effort log so we can disable later
+      // 👇 Log every message so /disable-offers can close them all later
       try {
         await logOfferMessage({
           orderRecId,
+          sellerId: s.sellerId,
+          inventoryRecordId: s.inventoryRecordId,
           channelId,
           messageId,
+          offerPrice,
         });
       } catch (e) {
         console.warn("logOfferMessage warn:", e.message);
       }
 
-      results.push({ sellerId: s.sellerId, messageId, offerPrice });
+      results.push({ sellerId: s.sellerId, messageId });
     }
 
     res.json({ ok: true, sentCount: results.length, sent: results });
@@ -119,6 +79,7 @@ app.post("/offers", async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+
 
 /** External closer (e.g., order moved to Processed External) */
 app.post("/disable-offers", async (req, res) => {
