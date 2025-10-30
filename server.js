@@ -13,6 +13,8 @@ import {
   createSaleAndDecrement,
 } from "./lib/airtable.js";
 
+const processingOrders = new Set();
+
 const app = express();
 app.use(morgan("combined"));
 
@@ -109,38 +111,51 @@ app.post("/disable-offers", async (req, res) => {
 await initDiscord();
 await onButtonInteraction(async ({ action, orderRecId, sellerId, inventoryRecordId, offerPrice, channelId, messageId }) => {
   try {
-    if (action === "confirm") {
-      // 1) Create a Sales row + decrement inventory quantity
-      await createSaleAndDecrement({ inventoryId: inventoryRecordId, orderRecId, finalPrice: offerPrice });
+    if (action !== "confirm") {
+      await disableMessageButtonsGateway(channelId, messageId, `❌ ${sellerId} denied / not available.`);
+      return;
+    }
 
-      // 2) Disable the clicked message immediately
-      await disableMessageButtonsGateway(channelId, messageId, `✅ Matched by ${sellerId}.`);
+    // 1) In-memory mutex (protects against near-simultaneous clicks on this instance)
+    if (processingOrders.has(orderRecId)) {
+      await disableMessageButtonsGateway(channelId, messageId, "⏳ Already being processed by another click.");
+      return;
+    }
+    processingOrders.add(orderRecId);
 
-      // 3) Disable all other messages for this order
+    // 2) Idempotency guard in Airtable (protects against retries / other instances)
+    if (await hasSaleForOrder(orderRecId)) {
+      // Already sold/matched; close all buttons
       const msgs = await listOfferMessagesForOrder(orderRecId);
       await Promise.allSettled(
-        msgs
-          .filter(m => !(m.channelId === channelId && m.messageId === messageId))
-          .map(m =>
-            disableMessageButtonsGateway(
-              m.channelId,
-              m.messageId,
-              `✅ Matched by ${sellerId}. Offers closed.`
-            )
-          )
+        msgs.map(m => disableMessageButtonsGateway(m.channelId, m.messageId, "✅ Already matched. Offers closed."))
       );
-    } else if (action === "deny") {
-      // Disable only the pressed message
-      await disableMessageButtonsGateway(
-        channelId,
-        messageId,
-        `❌ ${sellerId} denied / not available.`
-      );
+      return;
     }
+
+    // 3) Create sale + decrement quantity
+    await createSaleAndDecrement({ inventoryId: inventoryRecordId, orderRecId, finalPrice: offerPrice });
+
+    // 4) Mark the order as matched (so any later paths see it)
+    await setOrderMatchedStatus(orderRecId, "Matched");
+
+    // 5) Disable clicked message immediately
+    await disableMessageButtonsGateway(channelId, messageId, `✅ Matched by ${sellerId}.`);
+
+    // 6) Disable all other messages for this order
+    const msgs = await listOfferMessagesForOrder(orderRecId);
+    await Promise.allSettled(
+      msgs
+        .filter(m => !(m.channelId === channelId && m.messageId === messageId))
+        .map(m => disableMessageButtonsGateway(m.channelId, m.messageId, "✅ Matched by another seller. Offers closed."))
+    );
   } catch (e) {
     console.error("Interaction handling error:", e);
+  } finally {
+    processingOrders.delete(orderRecId);
   }
 });
+
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("HTTP listening on :" + PORT));
