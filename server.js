@@ -3,9 +3,9 @@ import express from "express";
 import morgan from "morgan";
 import {
   initDiscord,
+  onButtonInteraction,
   sendOfferMessageGateway,
   disableMessageButtonsGateway,
-  onButtonInteraction
 } from "./lib/discord.js";
 import {
   logOfferMessage,
@@ -22,16 +22,21 @@ app.get("/health", (_req, res) => res.json({ ok: true, ts: new Date().toISOStrin
 app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: true }));
 
-/** Fan-out from Airtable */
+const isNum = (v) => typeof v === "number" && Number.isFinite(v);
+
+/** Receive one order + fan-out to sellers */
 app.post("/offers", async (req, res) => {
   try {
     const p = req.body || {};
     const orderRecId     = p?.order?.airtableRecordId;
-    const orderHumanId   = p?.order?.orderId;
-    const sku            = p?.order?.sku;
-    const size           = p?.order?.size;
-    const clientCountry  = p?.order?.clientCountry;
-    const clientVatRate  = p?.order?.clientVatRate;
+    const orderHumanId   = p?.order?.orderId || null;
+    const sku            = p?.order?.sku || null;
+    const size           = p?.order?.size || null;
+
+    // optional, mainly for labels
+    const clientCountry  = p?.order?.clientCountry || "Netherlands";
+    const clientVatRate  = p?.order?.clientVatRate ?? null;
+
     const sellers        = Array.isArray(p?.sellers) ? p.sellers : [];
 
     if (!orderRecId || sellers.length === 0) {
@@ -39,7 +44,40 @@ app.post("/offers", async (req, res) => {
     }
 
     const results = [];
+
     for (const s of sellers) {
+      // We expect Airtable to send normalized values after VAT logic.
+      // We still layer fallbacks to avoid blanks.
+      const suggested =
+        (isNum(s.normalizedSuggested) ? s.normalizedSuggested : null) ??
+        (isNum(s.sellingPriceSuggested) ? s.sellingPriceSuggested : null);
+
+      const adjustedMax =
+        (isNum(s.normalizedMax)        ? s.normalizedMax        : null) ??
+        (isNum(s.maxBuyNormalized)     ? s.maxBuyNormalized     : null) ??
+        (isNum(s.adjustedMax)          ? s.adjustedMax          : null) ??
+        (isNum(p?.order?.maxBuyNormalized) ? p.order.maxBuyNormalized : null);
+
+      // If adjustedMax is missing, do NOT send (prevents “blank offer”)
+      if (!isNum(adjustedMax)) {
+        console.warn("[fanout:skip] adjustedMax missing for seller", {
+          seller: s.sellerName || s.sellerId,
+          suggested, adjustedMax,
+        });
+        continue;
+      }
+
+      // Debug visibility
+      console.log("[fanout]", {
+        seller: s.sellerName || s.sellerId,
+        suggested,
+        adjustedMax,
+        vatType: s.vatType || null,
+        sellerCountry: s.sellerCountry || "",
+        qty: s.quantity ?? 1,
+      });
+
+      // Send to Discord
       const { channelId, messageId, offerPrice } = await sendOfferMessageGateway({
         orderRecId,
         orderHumanId,
@@ -49,24 +87,30 @@ app.post("/offers", async (req, res) => {
         productName: s.productName || null,
         sku,
         size,
-        suggested: s.sellingPriceSuggested,
-        normalizedSuggested: s.normalizedSuggested,   // if present from Airtable script
-        adjustedMax: s.adjustedMax,                   // if present from Airtable script
-        vatType: s.vatType,
-        sellerCountry: s.sellerCountry,
-        clientCountry,
+        // price inputs
+        suggested,
+        adjustedMax,
+        // meta for labels
+        vatType: s.vatType || null,
+        sellerCountry: s.sellerCountry || "",
+        sellerVatRatePct: s.sellerVatRatePct ?? 21,   // not used in calc here, only label if needed
+        clientCountry,                                 // we (buyer) are NL
         clientVatRate,
         quantity: s.quantity ?? 1,
       });
 
-      // ✅ LOG THE MESSAGE so we can find & disable it later
-      await logOfferMessage({
-        orderRecId,
-        channelId,
-        messageId,
-      });
+      // Best-effort log so we can disable later
+      try {
+        await logOfferMessage({
+          orderRecId,
+          channelId,
+          messageId,
+        });
+      } catch (e) {
+        console.warn("logOfferMessage warn:", e.message);
+      }
 
-      results.push({ sellerId: s.sellerId, messageId });
+      results.push({ sellerId: s.sellerId, messageId, offerPrice });
     }
 
     res.json({ ok: true, sentCount: results.length, sent: results });
@@ -76,7 +120,7 @@ app.post("/offers", async (req, res) => {
   }
 });
 
-/** Close offers externally (e.g., order moved to Processed External) */
+/** External closer (e.g., order moved to Processed External) */
 app.post("/disable-offers", async (req, res) => {
   try {
     const { orderRecId, reason } = req.body || {};
@@ -105,10 +149,10 @@ await initDiscord();
 await onButtonInteraction(async ({ action, orderRecId, sellerId, inventoryRecordId, offerPrice, channelId, messageId }) => {
   try {
     if (action === "confirm") {
-      // 1) Create Sales row + decrement Quantity
+      // 1) Create a Sales row + decrement inventory quantity
       await createSaleAndDecrement({ inventoryId: inventoryRecordId, orderRecId, finalPrice: offerPrice });
 
-      // 2) Disable the message that was clicked immediately
+      // 2) Disable the clicked message immediately
       await disableMessageButtonsGateway(channelId, messageId, `✅ Matched by ${sellerId}.`);
 
       // 3) Disable all other messages for this order
@@ -125,7 +169,7 @@ await onButtonInteraction(async ({ action, orderRecId, sellerId, inventoryRecord
           )
       );
     } else if (action === "deny") {
-      // Disable only the pressed message on deny
+      // Disable only the pressed message
       await disableMessageButtonsGateway(
         channelId,
         messageId,
