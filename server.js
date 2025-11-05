@@ -113,11 +113,17 @@ app.post("/disable-offers", async (req, res) => {
 await initDiscord();
 await onButtonInteraction(async ({ action, orderRecId, sellerId, inventoryRecordId, offerPrice, channelId, messageId }) => {
   try {
-    if (action !== "confirm") {
+    // 🔒 Only react to this service's actions. Ignore external (_ext) buttons.
+    if (!["confirm", "deny"].includes(action)) {
+      return; // ignore confirm_ext / deny_ext etc.
+    }
+
+    if (action === "deny") {
       await disableMessageButtonsGateway(channelId, messageId, `❌ ${sellerId} denied / not available.`);
       return;
     }
 
+    // action === "confirm"
     // 1) In-memory mutex (protects against near-simultaneous clicks on this instance)
     if (processingOrders.has(orderRecId)) {
       await disableMessageButtonsGateway(channelId, messageId, "⏳ Already being processed by another click.");
