@@ -53,12 +53,12 @@ app.post("/offers", async (req, res) => {
         sku,
         size,
         suggested: s.normalizedSuggested ?? s.sellingPriceSuggested ?? null,
-        adjustedMax: undefined,
+        adjustedMax: s.normalizedMax ?? s.maxBuyNormalized ?? null,
+        showMax: false,
         vatType: s.vatType,
         sellerCountry: s.sellerCountry,
         clientCountry: "Netherlands",
         quantity: s.quantity ?? 1,
-        showMax: false,
       });
 
       // 👇 Log every message so /disable-offers can close them all later
