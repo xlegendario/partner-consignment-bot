@@ -6,6 +6,7 @@ import {
   onButtonInteraction,
   sendOfferMessageGateway,
   disableMessageButtonsGateway,
+  sendDealUpdateMessage,
 } from "./lib/discord.js";
 import {
   logOfferMessage,
@@ -81,6 +82,34 @@ app.post("/offers", async (req, res) => {
     res.json({ ok: true, sentCount: results.length, sent: results });
   } catch (e) {
     console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ───────────────── Deal Updates (called from Make) ─────────────────
+const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN; // set in Render (can reuse your bot token if you want)
+
+app.post("/deal-update", async (req, res) => {
+  try {
+    // Simple header auth
+    if (!DISCORD_BOT_TOKEN || req.headers["x-bot-key"] !== DISCORD_BOT_TOKEN) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+
+    const p = req.body || {};
+    const sellerId   = p.sellerId || null;
+    const sellerName = p.sellerName || sellerId;
+    const content    = p.content;
+    const embed      = p.embed || null;
+
+    if (!sellerName || !content) {
+      return res.status(400).json({ error: "sellerName (or sellerId) and content are required" });
+    }
+
+    const msg = await sendDealUpdateMessage({ sellerId, sellerName, content, embed });
+    res.json({ ok: true, messageId: msg.id, channelId: msg.channel_id });
+  } catch (e) {
+    console.error("deal-update error:", e);
     res.status(500).json({ error: e.message });
   }
 });
